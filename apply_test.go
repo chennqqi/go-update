@@ -4,26 +4,27 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/rand"
-	"crypto/sha256"
+	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
 	"io/ioutil"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 
-	"github.com/inconshreveable/go-update/internal/binarydist"
+	"github.com/kr/binarydist"
 )
 
 var (
-	oldFile         = []byte{0xDE, 0xAD, 0xBE, 0xEF}
-	newFile         = []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}
-	newFileChecksum = sha256.Sum256(newFile)
+	oldFile = []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	newFile = []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}
 )
 
 func cleanup(path string) {
 	os.Remove(path)
-	os.Remove(fmt.Sprintf(".%s.new", path))
 }
 
 // we write with a separate name for each test so that we can run them in parallel
@@ -48,65 +49,112 @@ func validateUpdate(path string, err error, t *testing.T) {
 	}
 }
 
-func TestApplySimple(t *testing.T) {
-	fName := "TestApplySimple"
+func TestFromStream(t *testing.T) {
+	t.Parallel()
+
+	fName := "TestFromStream"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
-	err := Apply(bytes.NewReader(newFile), Options{
-		TargetPath: fName,
-	})
+	err, _ := New().Target(fName).FromStream(bytes.NewReader(newFile))
 	validateUpdate(fName, err, t)
 }
 
-func TestApplyOldSavePath(t *testing.T) {
-	fName := "TestApplyOldSavePath"
+func TestFromFile(t *testing.T) {
+	t.Parallel()
+
+	fName := "TestFromFile"
+	newFName := "NewTestFromFile"
+	defer cleanup(fName)
+	defer cleanup(newFName)
+	writeOldFile(fName, t)
+
+	if err := ioutil.WriteFile(newFName, newFile, 0777); err != nil {
+		t.Fatalf("Failed to write file to update from: %v", err)
+	}
+
+	err, _ := New().Target(fName).FromFile(newFName)
+	validateUpdate(fName, err, t)
+}
+
+func TestFromUrl(t *testing.T) {
+	t.Parallel()
+
+	fName := "TestFromUrl"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
-	oldfName := "OldSavePath"
-
-	err := Apply(bytes.NewReader(newFile), Options{
-		TargetPath:  fName,
-		OldSavePath: oldfName,
-	})
-	validateUpdate(fName, err, t)
-
-	if _, err := os.Stat(oldfName); os.IsNotExist(err) {
-		t.Fatalf("Failed to find the old file: %v", err)
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Couldn't bind listener: %v", err)
 	}
+	addr := l.Addr().String()
 
-	cleanup(oldfName)
+	go http.Serve(l, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(newFile)
+	}))
+
+	err, _ = New().Target(fName).FromUrl("http://" + addr)
+	validateUpdate(fName, err, t)
+}
+
+func TestFromUrlCustomHTTPClient(t *testing.T) {
+	t.Parallel()
+
+	fName := "TestFromUrl"
+	defer cleanup(fName)
+	writeOldFile(fName, t)
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(newFile)
+	}))
+
+	server.StartTLS()
+
+	noTLSClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	testUpdate := &Update{HTTPClient: noTLSClient}
+
+	err, _ := testUpdate.Target(fName).FromUrl(server.URL)
+	validateUpdate(fName, err, t)
 }
 
 func TestVerifyChecksum(t *testing.T) {
+	t.Parallel()
+
 	fName := "TestVerifyChecksum"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
-	err := Apply(bytes.NewReader(newFile), Options{
-		TargetPath: fName,
-		Checksum:   newFileChecksum[:],
-	})
+	checksum, err := ChecksumForBytes(newFile)
+	if err != nil {
+		t.Fatalf("Failed to compute checksum: %v", err)
+	}
+
+	err, _ = New().Target(fName).VerifyChecksum(checksum).FromStream(bytes.NewReader(newFile))
 	validateUpdate(fName, err, t)
 }
 
 func TestVerifyChecksumNegative(t *testing.T) {
+	t.Parallel()
+
 	fName := "TestVerifyChecksumNegative"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
 	badChecksum := []byte{0x0A, 0x0B, 0x0C, 0xFF}
-	err := Apply(bytes.NewReader(newFile), Options{
-		TargetPath: fName,
-		Checksum:   badChecksum,
-	})
+	err, _ := New().Target(fName).VerifyChecksum(badChecksum).FromStream(bytes.NewReader(newFile))
 	if err == nil {
 		t.Fatalf("Failed to detect bad checksum!")
 	}
 }
 
 func TestApplyPatch(t *testing.T) {
+	t.Parallel()
+
 	fName := "TestApplyPatch"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
@@ -117,69 +165,53 @@ func TestApplyPatch(t *testing.T) {
 		t.Fatalf("Failed to create patch: %v", err)
 	}
 
-	err = Apply(patch, Options{
-		TargetPath: fName,
-		Patcher:    NewBSDiffPatcher(),
-	})
+	up := New().Target(fName).ApplyPatch(PATCHTYPE_BSDIFF)
+	err, _ = up.FromStream(bytes.NewReader(patch.Bytes()))
 	validateUpdate(fName, err, t)
 }
 
 func TestCorruptPatch(t *testing.T) {
+	t.Parallel()
+
 	fName := "TestCorruptPatch"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
 	badPatch := []byte{0x44, 0x38, 0x86, 0x3c, 0x4f, 0x8d, 0x26, 0x54, 0xb, 0x11, 0xce, 0xfe, 0xc1, 0xc0, 0xf8, 0x31, 0x38, 0xa0, 0x12, 0x1a, 0xa2, 0x57, 0x2a, 0xe1, 0x3a, 0x48, 0x62, 0x40, 0x2b, 0x81, 0x12, 0xb1, 0x21, 0xa5, 0x16, 0xed, 0x73, 0xd6, 0x54, 0x84, 0x29, 0xa6, 0xd6, 0xb2, 0x1b, 0xfb, 0xe6, 0xbe, 0x7b, 0x70}
-	err := Apply(bytes.NewReader(badPatch), Options{
-		TargetPath: fName,
-		Patcher:    NewBSDiffPatcher(),
-	})
+	up := New().Target(fName).ApplyPatch(PATCHTYPE_BSDIFF)
+	err, _ := up.FromStream(bytes.NewReader(badPatch))
 	if err == nil {
 		t.Fatalf("Failed to detect corrupt patch!")
 	}
 }
 
 func TestVerifyChecksumPatchNegative(t *testing.T) {
+	t.Parallel()
+
 	fName := "TestVerifyChecksumPatchNegative"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
+	checksum, err := ChecksumForBytes(newFile)
+	if err != nil {
+		t.Fatalf("Failed to compute checksum: %v", err)
+	}
+
 	patch := new(bytes.Buffer)
 	anotherFile := []byte{0x77, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66}
-	err := binarydist.Diff(bytes.NewReader(oldFile), bytes.NewReader(anotherFile), patch)
+	err = binarydist.Diff(bytes.NewReader(oldFile), bytes.NewReader(anotherFile), patch)
 	if err != nil {
 		t.Fatalf("Failed to create patch: %v", err)
 	}
 
-	err = Apply(patch, Options{
-		TargetPath: fName,
-		Checksum:   newFileChecksum[:],
-		Patcher:    NewBSDiffPatcher(),
-	})
+	up := New().Target(fName).ApplyPatch(PATCHTYPE_BSDIFF).VerifyChecksum(checksum)
+	err, _ = up.FromStream(bytes.NewReader(patch.Bytes()))
 	if err == nil {
 		t.Fatalf("Failed to detect patch to wrong file!")
 	}
 }
 
-const ecdsaPublicKey = `
------BEGIN PUBLIC KEY-----
-MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEL8ThbSyEucsCxnd4dCZR2hIy5nea54ko
-O+jUUfIjkvwhCWzASm0lpCVdVpXKZXIe+NZ+44RQRv3+OqJkCCGzUgJkPNI3lxdG
-9zu8rbrnxISV06VQ8No7Ei9wiTpqmTBB
------END PUBLIC KEY-----
-`
-
-const ecdsaPrivateKey = `
------BEGIN EC PRIVATE KEY-----
-MIGkAgEBBDBttCB/1NOY4T+WrG4FSV49Ayn3gK1DNzfGaJ01JUXeiNFCWQM2pqpU
-om8ATPP/dkegBwYFK4EEACKhZANiAAQvxOFtLIS5ywLGd3h0JlHaEjLmd5rniSg7
-6NRR8iOS/CEJbMBKbSWkJV1Wlcplch741n7jhFBG/f46omQIIbNSAmQ80jeXF0b3
-O7ytuufEhJXTpVDw2jsSL3CJOmqZMEE=
------END EC PRIVATE KEY-----
-`
-
-const rsaPublicKey = `
------BEGIN PUBLIC KEY-----
+const publicKey = `-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxSWmu7trWKAwDFjiCN2D
 Tk2jj2sgcr/CMlI4cSSiIOHrXCFxP1I8i9PvQkd4hasXQrLbT5WXKrRGv1HKUKab
 b9ead+kD0kxk7i2bFYvKX43oq66IW0mOLTQBO7I9UyT4L7svcMD+HUQ2BqHoaQe4
@@ -189,8 +221,7 @@ x4xRnjgTRRRlZvRtALHMUkIChgxDOhoEzKpGiqnX7HtMJfrhV6h0PAXNA4h9Kjv5
 fQIDAQAB
 -----END PUBLIC KEY-----`
 
-const rsaPrivateKey = `
------BEGIN RSA PRIVATE KEY-----
+const privateKey = `-----BEGIN RSA PRIVATE KEY-----
 MIIEogIBAAKCAQEAxSWmu7trWKAwDFjiCN2DTk2jj2sgcr/CMlI4cSSiIOHrXCFx
 P1I8i9PvQkd4hasXQrLbT5WXKrRGv1HKUKabb9ead+kD0kxk7i2bFYvKX43oq66I
 W0mOLTQBO7I9UyT4L7svcMD+HUQ2BqHoaQe4y20C59dPr9Dpcz8DZkdLsBV6YKF6
@@ -218,29 +249,23 @@ Oh9AgABamU0eb3p3vXTISClVgV7ifq1HyZ7BSUhMfaY2Jk/s3sUHCWFxPZe9sgEG
 KinIY/373KIkIV/5g4h2v1w330IWcfptxKcY/Er3DJr38f695GE=
 -----END RSA PRIVATE KEY-----`
 
-func signec(privatePEM string, source []byte, t *testing.T) []byte {
-	parseFn := func(p []byte) (crypto.Signer, error) { return x509.ParseECPrivateKey(p) }
-	return sign(parseFn, privatePEM, source, t)
-}
-
-func signrsa(privatePEM string, source []byte, t *testing.T) []byte {
-	parseFn := func(p []byte) (crypto.Signer, error) { return x509.ParsePKCS1PrivateKey(p) }
-	return sign(parseFn, privatePEM, source, t)
-}
-
-func sign(parsePrivKey func([]byte) (crypto.Signer, error), privatePEM string, source []byte, t *testing.T) []byte {
+func sign(privatePEM string, source []byte, t *testing.T) []byte {
 	block, _ := pem.Decode([]byte(privatePEM))
 	if block == nil {
 		t.Fatalf("Failed to parse private key PEM")
 	}
 
-	priv, err := parsePrivKey(block.Bytes)
+	priv, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	if err != nil {
-		t.Fatalf("Failed to parse private key DER: %v", err)
+		t.Fatalf("Failed to parse private key DER")
 	}
 
-	checksum := sha256.Sum256(source)
-	sig, err := priv.Sign(rand.Reader, checksum[:], crypto.SHA256)
+	checksum, err := ChecksumForBytes(source)
+	if err != nil {
+		t.Fatalf("Failed to make checksum")
+	}
+
+	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, checksum)
 	if err != nil {
 		t.Fatalf("Failed to sign: %v", sig)
 	}
@@ -248,153 +273,135 @@ func sign(parsePrivKey func([]byte) (crypto.Signer, error), privatePEM string, s
 	return sig
 }
 
-func TestVerifyECSignature(t *testing.T) {
-	fName := "TestVerifyECSignature"
+func TestVerifySignature(t *testing.T) {
+	t.Parallel()
+
+	fName := "TestVerifySignature"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
-	opts := Options{TargetPath: fName}
-	err := opts.SetPublicKeyPEM([]byte(ecdsaPublicKey))
+	up, err := New().Target(fName).VerifySignatureWithPEM([]byte(publicKey))
 	if err != nil {
 		t.Fatalf("Could not parse public key: %v", err)
 	}
 
-	opts.Signature = signec(ecdsaPrivateKey, newFile, t)
-	err = Apply(bytes.NewReader(newFile), opts)
-	validateUpdate(fName, err, t)
-}
-
-func TestVerifyRSASignature(t *testing.T) {
-	fName := "TestVerifyRSASignature"
-	defer cleanup(fName)
-	writeOldFile(fName, t)
-
-	opts := Options{
-		TargetPath: fName,
-		Verifier:   NewRSAVerifier(),
-	}
-	err := opts.SetPublicKeyPEM([]byte(rsaPublicKey))
-	if err != nil {
-		t.Fatalf("Could not parse public key: %v", err)
-	}
-
-	opts.Signature = signrsa(rsaPrivateKey, newFile, t)
-	err = Apply(bytes.NewReader(newFile), opts)
+	signature := sign(privateKey, newFile, t)
+	err, _ = up.VerifySignature(signature).FromStream(bytes.NewReader(newFile))
 	validateUpdate(fName, err, t)
 }
 
 func TestVerifyFailBadSignature(t *testing.T) {
+	t.Parallel()
+
 	fName := "TestVerifyFailBadSignature"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
-	opts := Options{
-		TargetPath: fName,
-		Signature:  []byte{0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA},
-	}
-	err := opts.SetPublicKeyPEM([]byte(ecdsaPublicKey))
+	up, err := New().Target(fName).VerifySignatureWithPEM([]byte(publicKey))
 	if err != nil {
 		t.Fatalf("Could not parse public key: %v", err)
 	}
 
-	err = Apply(bytes.NewReader(newFile), opts)
+	badSig := []byte{0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA}
+	err, _ = up.VerifySignature(badSig).FromStream(bytes.NewReader(newFile))
 	if err == nil {
 		t.Fatalf("Did not fail with bad signature")
 	}
 }
 
 func TestVerifyFailNoSignature(t *testing.T) {
+	t.Parallel()
+
 	fName := "TestVerifySignatureWithPEM"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
-	opts := Options{TargetPath: fName}
-	err := opts.SetPublicKeyPEM([]byte(ecdsaPublicKey))
+	up, err := New().Target(fName).VerifySignatureWithPEM([]byte(publicKey))
 	if err != nil {
 		t.Fatalf("Could not parse public key: %v", err)
 	}
 
-	err = Apply(bytes.NewReader(newFile), opts)
+	err, _ = up.VerifySignature([]byte{}).FromStream(bytes.NewReader(newFile))
 	if err == nil {
 		t.Fatalf("Did not fail with empty signature")
 	}
 }
 
-const wrongKey = `
------BEGIN EC PRIVATE KEY-----
-MIGkAgEBBDBzqYp6N2s8YWYifBjS03/fFfmGeIPcxQEi+bbFeekIYt8NIKIkhD+r
-hpaIwSmot+qgBwYFK4EEACKhZANiAAR0EC8Usbkc4k30frfEB2ECmsIghu9DJSqE
-RbH7jfq2ULNv8tN/clRjxf2YXgp+iP3SQF1R1EYERKpWr8I57pgfIZtoZXjwpbQC
-VBbP/Ff+05HOqwPC7rJMy1VAJLKg7Cw=
------END EC PRIVATE KEY-----
-`
+const wrongKey = `-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEArKqjT+xOFJILe0CX7lKfQy52YwWLF9devYtLeUHTbPOueGLy
+6CjrXJBrWIxNBxRd53y4dtgiMqCX6Gmmvuy8HnfbBuJjR2mcdEYo8UDy+aSVBQ6T
+/ND7Fd7KSzOruEFFzl2QFnZ/SrW/nsXdGyuF8l+YIwjZJRyV6StZkZ4ydOzOqUk9
+FXTeIkhX/Q7/jTETw7L3wxMyLgJAlV3lxDsPkMjxymngtbAIjwEjLsVeU+Prcz2e
+Ww34SZQ8qwzAdXieuDPryMwEsCcgc5NAKJFNL8TppYGDXOHI7CRXqHfNiJq2R+kQ
+LdxRvmfx8/iu4xM2hBzk4uSDS6TTn2AnWBm+cQIDAQABAoIBAFp//aUwaCRj/9yU
+GI3zhEJEIgz4pNTUL3YNgnuFwvlCJ9o1kreYavRTRdBdiSoCxM1GE7FGy3XZsoVA
+iwNbNaaKj6RmGD8f3b8b3u3EaxXp66mA4JQMPO5TnZgY9xJWM+5cH9+GMGXKKStg
+7ekFwOkuraD/TEElYHWcIRAv6KZbc/YOIa6YDKi+1Gc7u0MeIvwqN7nwaBAoJKUE
+ZrJIfYKIViD/ZrCpgWN47C9x8w3ne7iiDrYoYct+0reC9LFlqwVBtDnyVx/q3upW
+zzczbNQagu3w0QgprDGhy0ZhDNxuylV3XBWTB+xBrFQgz6rD3LzUPywlbt0N7ZmD
+936MVSECgYEA1IElCahF/+hC/OxFgy98DubAUDGmrvxWeZF3bvTseWZQp/gzxVS+
+SYumYyd2Ysx5+UjXQlVgR6BbDG13+DpSpZm6+MeWHBAR+KA2qCg009SDFv7l26/d
+xMT7lvIWz7ckQDb/+jvhF9HL2llyTN1Zex+n3XBeAMKNrPaubdEBFsUCgYEA0AIO
+tZMtzOpioAR1lGbwIguq04msDdrJNaY2TKrLeviJuQUw94fgL+3ULAPsiyxaU/Gv
+vln11R7aIp1SJ09T2UoFRbty+6SGRC56+Wh0pn5VnAi7aT6qdkYWhEjhqRHuXosf
+PYboXBuMwA0FBUTxWQL/lux2PZgvBkniYh5jI70CgYEAk9KmhhpFX2gdOT3OeRxO
+CzufaemwDqfAK97yGwBLg4OV9dJliQ6TNCvt+amY489jxfJSs3UafZjh3TpFKyq/
+FS1kb+y+0hSnu7EPdFhLr1N0QUndcb3b4iY48V7EWYgHspfP5y1CPsSVLvXr2eZc
+eZaiuhqReavczAXpfsDWJhUCgYEAwmUp2gfyhc+G3IVOXaLWSPseaxP+9/PAl6L+
+nCgCgqpEC+YOHUee/SwHXhtMtcR9pnX5CKyKUuLCehcM8C/y7N+AjerhSsw3rwDB
+bNVyLydiWrDOdU1bga1+3aI/QwK/AxyB1b5+6ZXVtKZ2SrZj2Aw1UZcr6eSQDhB+
+wbQkcwECgYBF13FMA6OOon992t9H3I+4KDgmz6G6mz3bVXSoFWfO1p/yXP04BzJl
+jtLFvFVTZdMs2o/wTd4SL6gYjx9mlOWwM8FblmjfiNSUVIyye33fRntEAr1n+FYI
+Xhv6aVnNdaGehGIqQxXFoGyiJxG3RYNkSwaTOamxY1V+ceLuO26n2Q==
+-----END RSA PRIVATE KEY-----`
 
 func TestVerifyFailWrongSignature(t *testing.T) {
+	t.Parallel()
+
 	fName := "TestVerifyFailWrongSignature"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
-	opts := Options{TargetPath: fName}
-	err := opts.SetPublicKeyPEM([]byte(ecdsaPublicKey))
+	up, err := New().Target(fName).VerifySignatureWithPEM([]byte(publicKey))
 	if err != nil {
 		t.Fatalf("Could not parse public key: %v", err)
 	}
 
-	opts.Signature = signec(wrongKey, newFile, t)
-	err = Apply(bytes.NewReader(newFile), opts)
+	signature := sign(wrongKey, newFile, t)
+	err, _ = up.VerifySignature(signature).FromStream(bytes.NewReader(newFile))
 	if err == nil {
 		t.Fatalf("Verified an update that was signed by an untrusted key!")
 	}
 }
 
 func TestSignatureButNoPublicKey(t *testing.T) {
+	t.Parallel()
+
 	fName := "TestSignatureButNoPublicKey"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
-	err := Apply(bytes.NewReader(newFile), Options{
-		TargetPath: fName,
-		Signature:  signec(ecdsaPrivateKey, newFile, t),
-	})
+	sig := sign(privateKey, newFile, t)
+	err, _ := New().Target(fName).VerifySignature(sig).FromStream(bytes.NewReader(newFile))
 	if err == nil {
 		t.Fatalf("Allowed an update with a signautre verification when no public key was specified!")
 	}
 }
 
 func TestPublicKeyButNoSignature(t *testing.T) {
+	t.Parallel()
+
 	fName := "TestPublicKeyButNoSignature"
 	defer cleanup(fName)
 	writeOldFile(fName, t)
 
-	opts := Options{TargetPath: fName}
-	if err := opts.SetPublicKeyPEM([]byte(ecdsaPublicKey)); err != nil {
+	up, err := New().Target(fName).VerifySignatureWithPEM([]byte(publicKey))
+	if err != nil {
 		t.Fatalf("Could not parse public key: %v", err)
 	}
-	err := Apply(bytes.NewReader(newFile), opts)
+
+	err, _ = up.FromStream(bytes.NewReader(newFile))
 	if err == nil {
 		t.Fatalf("Allowed an update with no signautre when a public key was specified!")
-	}
-}
-
-func TestWriteError(t *testing.T) {
-	fName := "TestWriteError"
-	defer cleanup(fName)
-	writeOldFile(fName, t)
-
-	openFile = func(name string, flags int, perm os.FileMode) (*os.File, error) {
-		f, err := os.OpenFile(name, flags, perm)
-
-		// simulate Write() error by closing the file prematurely
-		f.Close()
-
-		return f, err
-	}
-	defer func() {
-		openFile = os.OpenFile
-	}()
-
-	err := Apply(bytes.NewReader(newFile), Options{TargetPath: fName})
-	if err == nil {
-		t.Fatalf("Allowed an update to an empty file")
 	}
 }
