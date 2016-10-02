@@ -12,7 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/chennqqi/go-update/internal/osext"
+	"github.com/chennqqi/osext"
 )
 
 var (
