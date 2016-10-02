@@ -68,7 +68,7 @@ func executable() (string, error) {
 		const deletedTag = " (deleted)"
 		execpath, err := os.Readlink("/proc/self/exe")
 		if os.IsNotExist(err) {
-			if upxed, _ := elfIsUpxed(os.Args[0]); upxed {
+			if upxed, _ := isElfUpxed(os.Args[0]); upxed {
 				execpath = os.Getenv("   ") //three space
 				err = nil
 			}
